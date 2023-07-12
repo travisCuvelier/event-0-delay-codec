@@ -3,20 +3,20 @@ close all
 
 addpath('elias_omega')
 
-%inverted pendulum model from https://ctms.engin.umich.edu/CTMS/index.php?example=InvertedPendulum&section=ControlDigital
-
 %plant model
+%https://www.informit.com/articles/article.aspx?p=32090&seqNum=2 operating
+%condition one from Exothermic CSTR
+
 
 Act = [-1.1680 -.0886; 2.003, -.2443]
 plantDim = size(Act,1);
-Bct =  eye(plantDim)*.2
+Bct =  eye(plantDim)*.2;
 
 sigmaInit = .05*eye(plantDim);
 
-
-
 Tsample = 1/100;
 
+%Build discrete time model
 syms x
 f(x) =  expm(Act*x)*(Bct*Bct')*expm(Act'*x);
 g = matlabFunction(int(f));
@@ -33,7 +33,7 @@ Q = integral(@(x) expm(Act*x)*expm(Act'*x),0,Tsample,'ArrayValued',true);
 
 
 %set up some simulation variables
-numIterations = 100000;
+numIterations = 10000;
 
 
 %if you want to loop over distortions, start here. can move somethings out
@@ -53,11 +53,8 @@ Ppred_init = sigmaInit^2*eye(plantDim);%"initial" post measurement KF
 
 %set up encoder, decoder, quantizer, etc
 
-cutoffs = [127,127]; %if cutoff= [21,21,21,21] the quantizer will 
-%have bins from -10 to 10 in intevals of 1 unit. Anything outside that must
-%be sent another way (elias)
-%rate distortion estimate is 13.5 bits or about 3.3 
-%bits per dimension. 2^3.3 = 10ish. We doubled it. Dont make
+cutoffs = [127,127]; %if cutoff= [21,21], the quantizer will 
+%have bins from -10 to 10 in intevals of 1 unit. Dont make
 %(prod(cuttoffs+1) anywhere near 2^64-1).
     
 uniformPrior = uint64(ones(prod(cutoffs+1),1));
@@ -69,16 +66,24 @@ dither = rand(plantDim,numIterations)-.5;%dither for quantization to
 encoderModel = sortedAdaptiveCutoffPMF64(uniformPrior,cutoffs);
 encoder = eventEncoder64(encoderModel);
 
-Dct = 4e-4; %continuous-time distortion contraint. this is what you'd want to change in your loop.
+Dct = 4e-4; %continuous-time distortion contraint. this is what you'd 
+            %want to change in your loop. you might also want to change
+            %cuttoffs and/or sampling rate. 
 
 Ddt = Tsample*Dct-bline; %discrete-time distortion constraint
 if(Ddt<0)
     error('sampling rate needs to be higher (Tsample smaller) to sustain this performance')
 end
 
+%solve the rate-distortion problem
 sensingPolicy = rateDistortionTracking(A,W,Q,Ddt,'mosek'); 
-C = sensingPolicy.C; 
+C = sensingPolicy.C; %fig 2 in the paper explains what these are.
 V = sensingPolicy.V;
+%sensingPolicy.minimumBits is R(D_{d,\tau}, \overline{Q}_{A.\tau},\tau) 
+%from the paper 
+
+%discrete time lower bound calculation
+dtLowerBound = theta_inv(sensingPolicy.minimumBits)/Tsample;
 
 encoderKF = simpleKalmanFilterTracking(A,C,W,V,xpred_init,Ppred_init);
 
@@ -259,4 +264,6 @@ for iteration = 1:numIterations
 
 
 end
+
+commCostBitsPerSec = mean(cwl)/Tsample; %bits per second comm cost. 
 
