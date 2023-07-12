@@ -35,6 +35,13 @@ Q = integral(@(x) expm(Act*x)*expm(Act'*x),0,Tsample,'ArrayValued',true);
 %set up some simulation variables
 numIterations = 100000;
 
+
+%if you want to loop over distortions, start here. can move somethings out
+%of the loop like "cuttoffs" and "uniformPrior" if you're not going to
+%change the cuttoffs at each distortion. I didn't do this due the thematic
+%organization
+
+%more simulation setup 
 x = zeros(plantDim,numIterations);
 xhat = zeros(plantDim,numIterations);
 y = zeros(plantDim,numIterations);
@@ -50,25 +57,26 @@ cutoffs = [127,127]; %if cutoff= [21,21,21,21] the quantizer will
 %have bins from -10 to 10 in intevals of 1 unit. Anything outside that must
 %be sent another way (elias)
 %rate distortion estimate is 13.5 bits or about 3.3 
-%bits per dimension. 2^3.3 = 10ish. We doubled it.
+%bits per dimension. 2^3.3 = 10ish. We doubled it. Dont make
+%(prod(cuttoffs+1) anywhere near 2^64-1).
     
 uniformPrior = uint64(ones(prod(cutoffs+1),1));
-delta = eye(size(Act,1));%sqrtm(12}{":"*policyStruct.V); to save time I hard coded delta
+
 herald = 0; %don't change this
-
-
-dither = rand(plantDim,numIterations)-.5;
+dither = rand(plantDim,numIterations)-.5;%dither for quantization to 
+                                         %integer lattice. don't change
 
 encoderModel = sortedAdaptiveCutoffPMF64(uniformPrior,cutoffs);
 encoder = eventEncoder64(encoderModel);
 
-Dct = 4e-4; %continuous-time distortion contraint
-Ddt = Tsample*Dct-bline;
+Dct = 4e-4; %continuous-time distortion contraint. this is what you'd want to change in your loop.
+
+Ddt = Tsample*Dct-bline; %discrete-time distortion constraint
 if(Ddt<0)
     error('sampling rate needs to be higher (Tsample smaller) to sustain this performance')
 end
 
-sensingPolicy = rateDistortionTracking(A,W,Q,Ddt,'mosek'); %about 13.5 bits
+sensingPolicy = rateDistortionTracking(A,W,Q,Ddt,'mosek'); 
 C = sensingPolicy.C; 
 V = sensingPolicy.V;
 
@@ -106,41 +114,66 @@ for iteration = 1:numIterations
     measurement = C*(x(:,iteration)-encoderKF.xpred);
 
     %turn measurement into a tuple of positive integers. 
-    symbols = quantizeAndThread(measurement+dither(:,iteration)).'; %asssumes delta = eye(4)
+    symbols = quantizeAndThread(measurement+dither(:,iteration)).'; 
+    %quantizeAndThread first quantizes measurement to integer lattice, 
+    %then bijectivelly wraps these points to a tuple of positive integers.
+    %this tuple is easier to encode with this cutoff method. pretty much,
+    %symbols(idx) overflows if symbols(idx)>cutoffs(idx). 
 
-    %figure our the measurement the decoder will eventually recieve (either
-    %this iteration or the next iteration) and update the encoder's kalman
-    %filter accordingly
-    measurementDecoderEventuallyReceives = unthreadAndReconstruct(symbols).'+C*encoderKF.xpred-dither(:,iteration);
+
+    %the encoder figures out the measurement the decoder will eventually
+    %recieve (either this iteration or the next iteration depending on
+    %whether or not there was an overflow) and update its KF accordingly. 
+    measurementDecoderEventuallyReceives = ...
+        unthreadAndReconstruct(symbols).'+C*encoderKF.xpred-...
+                                                    dither(:,iteration);
+
     encoderKF.measurementUpdate(measurementDecoderEventuallyReceives);
     encoderKF.predictUpdate();
+
 
     %figure out if there are any overflows, and if so save them to encode
     %next time. 
     txOverflows = symbols(symbols>cutoffs);
     txNumOverflows = numel(txOverflows);
-    totalOverflows = totalOverflows+txNumOverflows; %count overflows over simulation
-
+    totalOverflows = totalOverflows+txNumOverflows; %track total overflows
+                                                    %over simulation. if
+                                                    %you loop this over
+                                                    %multiple distortions,
+                                                    %maybe index this
+                                                    %variable to keep track
+                                                    %of overflows at each
+                                                    %distortion level. 
 
     %replace "overflows" with escape symbol (0). 
     symbolsToEncodeNormally = symbols;
-    symbolsToEncodeNormally(symbolsToEncodeNormally>cutoffs) = herald; %escape symbols
+    symbolsToEncodeNormally(symbolsToEncodeNormally>cutoffs) = herald; 
+    %herald = the escape symbol
     %the herald indicates that the beginning of the next tramsission will
     %consist of overflowed symbols
     
-    %encode the tuple with overflows replaced by escape using the
+    %encode the tuple with overflows replaced by escapes using the
     %nonsingular code. update probability model at encoder accordingly
     normalBits = encoder.encodeSymbol(symbolsToEncodeNormally);
-    encoderModel.updateModel(symbolsToEncodeNormally) %models only depend on "normally encoded bits" so they are updated each time regardless.
+    encoderModel.updateModel(symbolsToEncodeNormally) %models only depend 
+                                                      %on "normally
+                                                      %encoded bits" so
+                                                      %they are updated 
+                                                      %every time.
+
 
     %keep track of the bits count not including the overflows
     cwlNoOverflows(iteration)=length(normalBits);
 
-    bits = [bits, normalBits];
-    cwl(iteration) = numel(bits);
+    bits = [bits, normalBits]; %total bits is overflow encoding from 
+                               %beginning plus this time's NS encoding. 
 
+    cwl(iteration) = numel(bits); %track total num bits. If you loop this 
+                                  %over distrotions, you'll want to 
+                                  %compute the mean of this for each
+                                  %distortion level. 
+                                  
     %% the decoder
-
 
     %if on the previous iteration the recieved transmission included
     %escape symbols (encoded with the nonsingular code), then this
@@ -217,7 +250,11 @@ for iteration = 1:numIterations
         %the if(rxNumOverflows~=0)  block.
     end
 
-    tcost(iteration) = (x(:,iteration)-estimates(:,iteration))'*Q*(x(:,iteration)- estimates(:,iteration));
+    %compute tracking error. Compare this to Ddt. 
+    tcost(iteration) = (x(:,iteration)-estimates(:,iteration))'*Q*...
+                                (x(:,iteration)- estimates(:,iteration));
+
+    %update plant. 
     x(:,iteration+1) = A*x(:,iteration)+sqrtm(W)*randn(plantDim,1);
 
 
